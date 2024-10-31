@@ -497,7 +497,7 @@ struct Args {
     print_ld_library_path: bool,
 
     /// Nix-built binary you'd like to wrap
-    nix_binary: PathBuf,
+    nix_binary: Option<PathBuf>,
 
     /// The args passed to the wrapped binary
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -641,6 +641,12 @@ fn main() -> std::io::Result<()> {
 
     let new_env = nvidia_main(&cache_dir, &host_dsos_paths, opt.print_ld_library_path)?;
 
+    if opt.print_ld_library_path {
+        return Ok(());
+    } else if opt.nix_binary.is_none() {
+        return Err(std::io::Error::new(ErrorKind::InvalidInput, "binary not specified"));
+    }
+
     if let Ok(elapsed) = SystemTime::now().duration_since(start_time) {
         log_info(&format!(
             "{:?} seconds elapsed since script start.",
@@ -651,7 +657,7 @@ fn main() -> std::io::Result<()> {
     for (key, value) in new_env {
         env::set_var(key, value);
     }
-    exec_binary(&opt.nix_binary, &opt.args)?;
+    exec_binary(&opt.nix_binary.unwrap(), &opt.args)?;
 
     Ok(())
 }
