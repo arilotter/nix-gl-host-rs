@@ -643,9 +643,14 @@ fn main() -> std::io::Result<()> {
 
     if opt.print_ld_library_path {
         return Ok(());
-    } else if opt.nix_binary.is_none() {
-        return Err(std::io::Error::new(ErrorKind::InvalidInput, "binary not specified"));
     }
+
+    let Some(nix_binary) = opt.nix_binary else {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "binary not specified",
+        ));
+    };
 
     if let Ok(elapsed) = SystemTime::now().duration_since(start_time) {
         log_info(&format!(
@@ -657,7 +662,7 @@ fn main() -> std::io::Result<()> {
     for (key, value) in new_env {
         env::set_var(key, value);
     }
-    exec_binary(&opt.nix_binary.unwrap(), &opt.args)?;
+    exec_binary(&nix_binary, &opt.args)?;
 
     Ok(())
 }
