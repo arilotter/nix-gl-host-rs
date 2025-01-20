@@ -526,11 +526,13 @@ fn nvidia_main(
         .write(true)
         .create(true)
         .truncate(true)
-        .open(&lock_path)?;
+        .open(&lock_path)
+        .with_context(|| format!("failed to open DSO lock path {lock_path:?}"))?;
 
     log_info("Acquiring the cache lock");
     let lock = Flock::lock(lock_file, FlockArg::LockExclusive)
-        .map_err(|e| std::io::Error::new(ErrorKind::AlreadyExists, e.1))?;
+        .map_err(|e| std::io::Error::new(ErrorKind::AlreadyExists, e.1))
+        .context("failed to acquire the cache lock")?;
     log_info("Cache lock acquired");
 
     for path in dso_vendor_paths {
@@ -567,9 +569,12 @@ fn nvidia_main(
 
         log_info(&format!("Moving {:?} to {:?}", tmp_cache_dir, cache_dir));
         if cache_dir.exists() {
-            fs::remove_dir_all(cache_dir)?;
+            fs::remove_dir_all(cache_dir)
+                .with_context(|| format!("failed to remove the old cache dir {cache_dir:?}"))?;
         }
-        fs::rename(tmp_cache_dir, cache_dir)?;
+        fs::rename(&tmp_cache_dir, cache_dir).with_context(|| {
+            format!("failed to move the tmp cache dir {tmp_cache_dir:?} to {cache_dir:?}")
+        })?;
         nix_gl_ld_library_path
     } else {
         log_info("The cache is up to date, re-using it.");
