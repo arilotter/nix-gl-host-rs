@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::io::ErrorKind;
+use std::io::{BufRead, ErrorKind};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -14,6 +14,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
+use glob::glob;
 
 const IN_NIX_STORE: bool = false;
 const CACHE_VERSION: i32 = 3;
@@ -213,12 +214,47 @@ lazy_static::lazy_static! {
     ];
 }
 
+fn parse_ld_conf_file(ld_conf_file_path: &Path) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let file = fs::File::open(ld_conf_file_path).unwrap();
+    for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with("#") {
+            continue;
+        }
+        if line.starts_with("include ") {
+            let mut dirglob = line.trim_start_matches("include ").to_string();
+            if !dirglob.starts_with("/") {
+                let mut search_path = ld_conf_file_path.canonicalize().unwrap().parent().unwrap().to_str().unwrap().to_string();
+                search_path += "/";
+                search_path += &dirglob;
+                dirglob = search_path;
+            }
+            for entry in glob(&dirglob).unwrap().flatten() {
+                paths.extend(parse_ld_conf_file(entry.as_path()));
+            }
+            continue;
+        }
+        paths.push(Path::new(line).to_path_buf());
+    }
+    paths
+}
+
 fn get_ld_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
     // Add LD_LIBRARY_PATH paths
     if let Ok(ld_path) = env::var("LD_LIBRARY_PATH") {
         paths.extend(ld_path.split(':').map(PathBuf::from));
+    }
+
+    // Add paths from ld.so.conf file
+    let ld_conf_file_path = Path::new("/etc/ld.so.conf");
+    if ld_conf_file_path.exists() {
+        paths.extend(parse_ld_conf_file(ld_conf_file_path));
     }
 
     // Add PREFIX paths if available
