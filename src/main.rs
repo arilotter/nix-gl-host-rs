@@ -608,7 +608,15 @@ fn nvidia_main(
             fs::remove_dir_all(cache_dir)
                 .with_context(|| format!("failed to remove the old cache dir {cache_dir:?}"))?;
         }
-        fs::rename(tmp_cache_dir, cache_dir)?;
+        let renamed = fs::rename(&tmp_cache_dir, cache_dir);
+        if renamed.is_err() {
+            log_info("failed to atomically move cache dir because of {err}. trying backup.");
+            copy_dir_all(&tmp_cache_dir, cache_dir).with_context(||
+                format!("failed to move the tmp cache dir {tmp_cache_dir:?} to {cache_dir:?} using the backup strategy.")
+            )?;
+            fs::remove_dir_all(&tmp_cache_dir)
+                .with_context(|| format!("failed to remove the tmp cache dir {tmp_cache_dir:?}"))?;
+        }
         nix_gl_ld_library_path
     } else {
         log_info("The cache is up to date, re-using it.");
@@ -647,6 +655,20 @@ fn nvidia_main(
 
     new_env.insert("LD_LIBRARY_PATH".to_string(), ld_library_path);
     Ok(new_env)
+}
+
+fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> std::io::Result<()> {
+    fs::create_dir_all(&dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            copy_dir_all(entry.path(), dst.as_ref().join(entry.file_name()))?;
+        } else {
+            fs::copy(entry.path(), dst.as_ref().join(entry.file_name()))?;
+        }
+    }
+    Ok(())
 }
 
 fn exec_binary(bin_path: &Path, args: &[String]) -> std::io::Result<std::process::Child> {
