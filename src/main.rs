@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
+use anyhow::{bail, Context};
 use nix::fcntl::{Flock, FlockArg};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -34,10 +35,11 @@ struct ResolvedLib {
 }
 
 impl ResolvedLib {
-    fn new(name: String, dirpath: String, fullpath: String) -> std::io::Result<Self> {
+    fn new(name: String, dirpath: String, fullpath: String) -> anyhow::Result<Self> {
         let metadata = fs::metadata(&fullpath)?;
         let last_modification = metadata
-            .modified()?
+            .modified()
+            .with_context(|| format!("failed to get metadata for resolved lib {fullpath}"))?
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_secs_f64();
@@ -314,7 +316,7 @@ fn copy_and_patch_libs(
     dsos: &[ResolvedLib],
     dest_dir: &Path,
     rpath: Option<&Path>,
-) -> std::io::Result<()> {
+) -> anyhow::Result<()> {
     let rpath = rpath.unwrap_or(dest_dir);
 
     for dso in dsos {
@@ -376,7 +378,7 @@ struct EglIcdConfig {
     library_path: String,
 }
 
-fn generate_nvidia_egl_config_files(egl_conf_dir: &Path) -> std::io::Result<()> {
+fn generate_nvidia_egl_config_files(egl_conf_dir: &Path) -> anyhow::Result<()> {
     let dso_paths = vec![
         ("10_nvidia.json", "libEGL_nvidia.so.0"),
         ("10_nvidia_wayland.json", "libnvidia-egl-wayland.so.1"),
@@ -442,7 +444,7 @@ fn cache_library_path(
     library_path: &LibraryPath,
     temp_cache_dir_root: &Path,
     final_cache_dir_root: &Path,
-) -> std::io::Result<String> {
+) -> anyhow::Result<String> {
     // Hash computation
     let mut hasher = Sha256::new();
     hasher.update(library_path.path.as_bytes());
@@ -497,7 +499,7 @@ fn generate_cache_metadata(
     cache_dir: &Path,
     cache_content: &CacheDirContent,
     cache_paths: &[String],
-) -> std::io::Result<String> {
+) -> anyhow::Result<String> {
     let cache_file_path = cache_dir.join("cache.json");
     let cached_ld_library_path = cache_dir.join("ld_library_path");
     let egl_conf_dir = cache_dir.join("egl-confs");
@@ -544,7 +546,7 @@ fn nvidia_main(
     cache_dir: &Path,
     dso_vendor_paths: &[PathBuf],
     print_ld_library_path: bool,
-) -> std::io::Result<HashMap<String, String>> {
+) -> anyhow::Result<HashMap<String, String>> {
     log_info("Nvidia routine begins");
 
     // Find Host DSOS
@@ -560,11 +562,13 @@ fn nvidia_main(
         .write(true)
         .create(true)
         .truncate(true)
-        .open(&lock_path)?;
+        .open(&lock_path)
+        .with_context(|| format!("failed to open DSO lock path {lock_path:?}"))?;
 
     log_info("Acquiring the cache lock");
     let lock = Flock::lock(lock_file, FlockArg::LockExclusive)
-        .map_err(|e| std::io::Error::new(ErrorKind::AlreadyExists, e.1))?;
+        .map_err(|e| std::io::Error::new(ErrorKind::AlreadyExists, e.1))
+        .context("failed to acquire the cache lock")?;
     log_info("Cache lock acquired");
 
     for path in dso_vendor_paths {
@@ -601,7 +605,8 @@ fn nvidia_main(
 
         log_info(&format!("Moving {:?} to {:?}", tmp_cache_dir, cache_dir));
         if cache_dir.exists() {
-            fs::remove_dir_all(cache_dir)?;
+            fs::remove_dir_all(cache_dir)
+                .with_context(|| format!("failed to remove the old cache dir {cache_dir:?}"))?;
         }
         fs::rename(tmp_cache_dir, cache_dir)?;
         nix_gl_ld_library_path
@@ -651,14 +656,14 @@ fn exec_binary(bin_path: &Path, args: &[String]) -> std::io::Result<std::process
     Err(Command::new(bin_path).args(args).exec())
 }
 
-fn main() -> std::io::Result<()> {
+fn main() -> anyhow::Result<()> {
     let opt = Args::parse();
 
     let start_time = SystemTime::now();
     let home = env::var("HOME").expect("HOME environment variable not set");
     let xdg_cache_home = env::var("XDG_CACHE_HOME").unwrap_or_else(|_| format!("{}/.cache", home));
     let cache_dir = PathBuf::from(xdg_cache_home).join("nix-gl-host");
-    fs::create_dir_all(&cache_dir)?;
+    fs::create_dir_all(&cache_dir).context("failed to create cache dir")?;
 
     log_info(&format!("Using {:?} as cache dir.", cache_dir));
 
@@ -680,10 +685,7 @@ fn main() -> std::io::Result<()> {
     }
 
     let Some(nix_binary) = opt.nix_binary else {
-        return Err(std::io::Error::new(
-            ErrorKind::InvalidInput,
-            "binary not specified",
-        ));
+        bail!("binary not specified, pass it as an argument!");
     };
 
     if let Ok(elapsed) = SystemTime::now().duration_since(start_time) {
