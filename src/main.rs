@@ -10,12 +10,12 @@ use std::process::Command;
 use std::time::SystemTime;
 
 use anyhow::{bail, Context};
+use glob::glob;
 use nix::fcntl::{Flock, FlockArg};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
-use glob::glob;
 
 const IN_NIX_STORE: bool = false;
 const CACHE_VERSION: i32 = 3;
@@ -230,7 +230,14 @@ fn parse_ld_conf_file(ld_conf_file_path: &Path) -> Vec<PathBuf> {
         if line.starts_with("include ") {
             let mut dirglob = line.trim_start_matches("include ").to_string();
             if !dirglob.starts_with("/") {
-                let mut search_path = ld_conf_file_path.canonicalize().unwrap().parent().unwrap().to_str().unwrap().to_string();
+                let mut search_path = ld_conf_file_path
+                    .canonicalize()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string();
                 search_path += "/";
                 search_path += &dirglob;
                 dirglob = search_path;
@@ -682,9 +689,17 @@ fn main() -> anyhow::Result<()> {
     let opt = Args::parse();
 
     let start_time = SystemTime::now();
-    let home = env::var("HOME").expect("HOME environment variable not set");
-    let xdg_cache_home = env::var("XDG_CACHE_HOME").unwrap_or_else(|_| format!("{}/.cache", home));
-    let cache_dir = PathBuf::from(xdg_cache_home).join("nix-gl-host");
+    let cache_dir = env::var("NIXGL_HOST_CACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let xdg_cache_home = env::var("XDG_CACHE_HOME").unwrap_or_else(|_| {
+                format!(
+                    "{}/.cache",
+                    env::var("HOME").expect("HOME environment variable not set")
+                )
+            });
+            PathBuf::from(xdg_cache_home).join("nix-gl-host")
+        });
     fs::create_dir_all(&cache_dir).context("failed to create cache dir")?;
 
     log_info(&format!("Using {:?} as cache dir.", cache_dir));
