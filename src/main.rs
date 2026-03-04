@@ -357,6 +357,8 @@ fn detect_driver_version(search_paths: &[PathBuf]) -> Option<String> {
     // Fallback: look for libcuda.so.*.* or libnvidia-ml.so.*.* in search paths
     log_info("modinfo failed, falling back to library filename detection");
     let version_re = Regex::new(r"^lib(?:cuda|nvidia-ml)\.so\.(\d+\.\d+(?:\.\d+)?)$").unwrap();
+    let mut versions = HashSet::<String>::new();
+
     for path in search_paths {
         if let Ok(entries) = fs::read_dir(path) {
             for entry in entries.filter_map(Result::ok) {
@@ -367,14 +369,103 @@ fn detect_driver_version(search_paths: &[PathBuf]) -> Option<String> {
                             "Detected driver version via filename {}: {}",
                             name, version
                         ));
-                        return Some(version);
+                        versions.insert(version);
                     }
                 }
             }
         }
     }
 
-    None
+    if versions.len() > 1 {
+        log_warn(&format!(
+            "WARNING: Multiple CUDA driver versions detected on this system: [{}]. \
+         This may indicate a broken, partially-upgraded, or misconfigured driver \
+         installation. Picking the newest version, but behaviour is undefined and \
+         crashes or silent errors are possible. Please ensure only one driver \
+         version is installed.",
+            versions.iter().cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
+
+    // parse a version string into a tuple of numeric components
+    let parse_version =
+        |v: &str| -> Vec<u64> { v.split('.').filter_map(|p| p.parse().ok()).collect() };
+
+    let newest_version = versions
+        .into_iter()
+        .max_by(|a, b| parse_version(a).cmp(&parse_version(b)));
+
+    if let Some(version) = &newest_version {
+        log_info(&format!("Detected driver version {version}"));
+    }
+
+    newest_version
+}
+
+fn get_soname(path: &Path) -> Option<String> {
+    let data = fs::read(path).ok()?;
+    match goblin::Object::parse(&data).ok()? {
+        goblin::Object::Elf(elf) => elf.soname.map(|s| s.to_string()),
+        _ => None,
+    }
+}
+
+fn get_so_link(name: &str) -> Option<String> {
+    let idx = name.find(".so")?;
+    Some(name[..idx + 3].to_string())
+}
+
+fn resolve_soname_symlinks(libs: &[ResolvedLib], dir: &Path) -> Vec<ResolvedLib> {
+    let mut extra = Vec::new();
+    let existing_names: HashSet<String> = libs.iter().map(|l| l.name.clone()).collect();
+
+    for lib in libs {
+        if lib.is_symlink {
+            continue;
+        }
+
+        let real_path = Path::new(&lib.fullpath);
+        let soname = match get_soname(real_path) {
+            Some(s) => s,
+            None => continue,
+        };
+
+        // Add SONAME symlink (e.g. libcuda.so.1) if it differs from the filename and exists
+        if soname != lib.name && !existing_names.contains(&soname) {
+            let soname_path = dir.join(&soname);
+            if soname_path.symlink_metadata().map_or(false, |m| m.file_type().is_symlink()) {
+                if let Ok(resolved) = ResolvedLib::new(
+                    soname.clone(),
+                    dir.to_string_lossy().into_owned(),
+                    soname_path.to_string_lossy().into_owned(),
+                ) {
+                    extra.push(resolved);
+                }
+            }
+        }
+
+        // Add bare .so link (e.g. libcuda.so) if it differs from SONAME and filename
+        let source_for_bare = if soname != lib.name { &soname } else { &lib.name };
+        if let Some(so_link) = get_so_link(source_for_bare) {
+            if so_link != soname && so_link != lib.name && !existing_names.contains(&so_link) {
+                let so_link_path = dir.join(&so_link);
+                if so_link_path
+                    .symlink_metadata()
+                    .map_or(false, |m| m.file_type().is_symlink())
+                {
+                    if let Ok(resolved) = ResolvedLib::new(
+                        so_link.clone(),
+                        dir.to_string_lossy().into_owned(),
+                        so_link_path.to_string_lossy().into_owned(),
+                    ) {
+                        extra.push(resolved);
+                    }
+                }
+            }
+        }
+    }
+
+    extra
 }
 
 fn resolve_versioned_libs(path: &Path, version: &str) -> Vec<ResolvedLib> {
@@ -400,9 +491,13 @@ fn resolve_versioned_libs(path: &Path, version: &str) -> Vec<ResolvedLib> {
         }
     }
 
+    // Reconstruct SONAME symlink chains for the main directory
+    libraries.extend(resolve_soname_symlinks(&libraries, path));
+
     // Also check vdpau/ subdirectory
     let vdpau_path = path.join("vdpau");
     if vdpau_path.is_dir() {
+        let mut vdpau_libs = Vec::new();
         let vdpau_pattern = format!("{}/*.so.{}", vdpau_path.to_string_lossy(), version);
         if let Ok(entries) = glob(&vdpau_pattern) {
             for entry in entries.filter_map(Result::ok) {
@@ -416,12 +511,16 @@ fn resolve_versioned_libs(path: &Path, version: &str) -> Vec<ResolvedLib> {
                             vdpau_path.to_string_lossy().into_owned(),
                             entry.to_string_lossy().into_owned(),
                         ) {
-                            libraries.push(lib);
+                            vdpau_libs.push(lib);
                         }
                     }
                 }
             }
         }
+        // Reconstruct SONAME symlink chains for vdpau
+        let vdpau_extra = resolve_soname_symlinks(&vdpau_libs, &vdpau_path);
+        libraries.extend(vdpau_libs);
+        libraries.extend(vdpau_extra);
     }
 
     libraries
@@ -434,8 +533,7 @@ fn copy_and_patch_libs(
 ) -> anyhow::Result<()> {
     let rpath = rpath.unwrap_or(dest_dir);
 
-    let (symlinks, real_files): (Vec<_>, Vec<_>) =
-        dsos.iter().partition(|dso| dso.is_symlink);
+    let (symlinks, real_files): (Vec<_>, Vec<_>) = dsos.iter().partition(|dso| dso.is_symlink);
 
     // Copy real files first
     for dso in &real_files {
@@ -463,10 +561,7 @@ fn copy_and_patch_libs(
                     dso.name, target
                 );
             }
-            log_info(&format!(
-                "Creating symlink {:?} -> {:?}",
-                newpath, target
-            ));
+            log_info(&format!("Creating symlink {:?} -> {:?}", newpath, target));
             std::os::unix::fs::symlink(target, &newpath)?;
         }
     }
@@ -487,6 +582,10 @@ fn log_info(message: &str) {
     if env::var("DEBUG").is_ok() {
         eprintln!("[+] {}", message);
     }
+}
+
+fn log_warn(message: &str) {
+    eprintln!("[+] {}", message);
 }
 
 fn patch_dsos(dso_paths: &[PathBuf], rpath: &Path) -> std::io::Result<()> {
