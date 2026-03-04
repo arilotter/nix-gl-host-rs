@@ -218,12 +218,6 @@ lazy_static::lazy_static! {
         Regex::new(r"libdxcore\.so.*$").unwrap(),
     ];
 
-    static ref CUDA_DSO_PATTERNS: Vec<Regex> = vec![
-        Regex::new(r"libcudadebugger\.so.*$").unwrap(),
-        Regex::new(r"libcuda\.so.*$").unwrap(),
-        Regex::new(r"libnvidia-ml\.so.*$").unwrap(),
-    ];
-
     static ref GLX_DSO_PATTERNS: Vec<Regex> = vec![
         Regex::new(r"libGLX_nvidia\.so.*$").unwrap(),
     ];
@@ -331,6 +325,96 @@ fn resolve_libraries(path: &Path, patterns: &[Regex]) -> Vec<ResolvedLib> {
                             file_name.to_string(),
                             path.to_string_lossy().into_owned(),
                             file_path.to_string_lossy().into_owned(),
+                        ) {
+                            libraries.push(lib);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    libraries
+}
+
+fn detect_driver_version(search_paths: &[PathBuf]) -> Option<String> {
+    // Primary: run modinfo nvidia and parse version line
+    if let Ok(output) = Command::new("modinfo").arg("nvidia").output() {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                if let Some(version) = line.strip_prefix("version:") {
+                    let version = version.trim().to_string();
+                    if !version.is_empty() {
+                        log_info(&format!("Detected driver version via modinfo: {}", version));
+                        return Some(version);
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: look for libcuda.so.*.* or libnvidia-ml.so.*.* in search paths
+    log_info("modinfo failed, falling back to library filename detection");
+    let version_re = Regex::new(r"^lib(?:cuda|nvidia-ml)\.so\.(\d+\.\d+(?:\.\d+)?)$").unwrap();
+    for path in search_paths {
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.filter_map(Result::ok) {
+                if let Some(name) = entry.file_name().to_str() {
+                    if let Some(caps) = version_re.captures(name) {
+                        let version = caps[1].to_string();
+                        log_info(&format!(
+                            "Detected driver version via filename {}: {}",
+                            name, version
+                        ));
+                        return Some(version);
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn resolve_versioned_libs(path: &Path, version: &str) -> Vec<ResolvedLib> {
+    let mut libraries = Vec::new();
+    let pattern = format!("{}/*.so.{}", path.to_string_lossy(), version);
+
+    if let Ok(entries) = glob(&pattern) {
+        for entry in entries.filter_map(Result::ok) {
+            let Ok(meta) = entry.symlink_metadata() else {
+                continue;
+            };
+            if meta.file_type().is_file() || meta.file_type().is_symlink() {
+                if let Some(file_name) = entry.file_name().and_then(|n| n.to_str()) {
+                    if let Ok(lib) = ResolvedLib::new(
+                        file_name.to_string(),
+                        path.to_string_lossy().into_owned(),
+                        entry.to_string_lossy().into_owned(),
+                    ) {
+                        libraries.push(lib);
+                    }
+                }
+            }
+        }
+    }
+
+    // Also check vdpau/ subdirectory
+    let vdpau_path = path.join("vdpau");
+    if vdpau_path.is_dir() {
+        let vdpau_pattern = format!("{}/*.so.{}", vdpau_path.to_string_lossy(), version);
+        if let Ok(entries) = glob(&vdpau_pattern) {
+            for entry in entries.filter_map(Result::ok) {
+                let Ok(meta) = entry.symlink_metadata() else {
+                    continue;
+                };
+                if meta.file_type().is_file() || meta.file_type().is_symlink() {
+                    if let Some(file_name) = entry.file_name().and_then(|n| n.to_str()) {
+                        if let Ok(lib) = ResolvedLib::new(
+                            file_name.to_string(),
+                            vdpau_path.to_string_lossy().into_owned(),
+                            entry.to_string_lossy().into_owned(),
                         ) {
                             libraries.push(lib);
                         }
@@ -478,13 +562,36 @@ fn is_dso_cache_up_to_date(dsos: &CacheDirContent, cache_file_path: &Path) -> bo
     false
 }
 
-fn scan_dsos_from_dir(path: &Path) -> Option<LibraryPath> {
+fn scan_dsos_from_dir(path: &Path, driver_version: &str) -> Option<LibraryPath> {
     let generic = resolve_libraries(path, &NVIDIA_DSO_PATTERNS);
 
     if !generic.is_empty() {
-        let cuda = resolve_libraries(path, &CUDA_DSO_PATTERNS);
         let glx = resolve_libraries(path, &GLX_DSO_PATTERNS);
         let egl = resolve_libraries(path, &EGL_DSO_PATTERNS);
+
+        // Collect names already in generic/glx/egl to subtract from versioned libs
+        let known_names: HashSet<String> = generic
+            .iter()
+            .chain(glx.iter())
+            .chain(egl.iter())
+            .map(|lib| lib.name.clone())
+            .collect();
+
+        // Glob *.so.<version> and subtract known libs to get the cuda set
+        let versioned = resolve_versioned_libs(path, driver_version);
+        let cuda: Vec<_> = versioned
+            .into_iter()
+            .filter(|lib| !known_names.contains(&lib.name))
+            .collect();
+
+        log_info(&format!(
+            "Found {} generic, {} glx, {} egl, {} cuda DSOs in {:?}",
+            generic.len(),
+            glx.len(),
+            egl.len(),
+            cuda.len(),
+            path
+        ));
 
         Some(LibraryPath {
             glx,
@@ -629,8 +736,21 @@ fn nvidia_main(
         .context("failed to acquire the cache lock")?;
     log_info("Cache lock acquired");
 
+    let driver_version = detect_driver_version(dso_vendor_paths);
+    match &driver_version {
+        Some(v) => log_info(&format!("Using driver version: {}", v)),
+        None => log_info("Could not detect driver version"),
+    }
+    let Some(driver_version) = driver_version else {
+        bail!(
+            "Could not detect NVIDIA driver version. \
+             Ensure the NVIDIA kernel module is loaded (modinfo nvidia) \
+             or that driver libraries (libcuda.so.*) exist in the search paths."
+        );
+    };
+
     for path in dso_vendor_paths {
-        if let Some(res) = scan_dsos_from_dir(path) {
+        if let Some(res) = scan_dsos_from_dir(path, &driver_version) {
             cache_content.paths.push(res);
         }
     }
