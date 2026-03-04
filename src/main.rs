@@ -433,7 +433,10 @@ fn resolve_soname_symlinks(libs: &[ResolvedLib], dir: &Path) -> Vec<ResolvedLib>
         // Add SONAME symlink (e.g. libcuda.so.1) if it differs from the filename and exists
         if soname != lib.name && !existing_names.contains(&soname) {
             let soname_path = dir.join(&soname);
-            if soname_path.symlink_metadata().map_or(false, |m| m.file_type().is_symlink()) {
+            if soname_path
+                .symlink_metadata()
+                .map_or(false, |m| m.file_type().is_symlink())
+            {
                 if let Ok(resolved) = ResolvedLib::new(
                     soname.clone(),
                     dir.to_string_lossy().into_owned(),
@@ -445,7 +448,11 @@ fn resolve_soname_symlinks(libs: &[ResolvedLib], dir: &Path) -> Vec<ResolvedLib>
         }
 
         // Add bare .so link (e.g. libcuda.so) if it differs from SONAME and filename
-        let source_for_bare = if soname != lib.name { &soname } else { &lib.name };
+        let source_for_bare = if soname != lib.name {
+            &soname
+        } else {
+            &lib.name
+        };
         if let Some(so_link) = get_so_link(source_for_bare) {
             if so_link != soname && so_link != lib.name && !existing_names.contains(&so_link) {
                 let so_link_path = dir.join(&so_link);
@@ -836,23 +843,20 @@ fn nvidia_main(
     log_info("Cache lock acquired");
 
     let driver_version = detect_driver_version(dso_vendor_paths);
-    match &driver_version {
-        Some(v) => log_info(&format!("Using driver version: {}", v)),
-        None => log_info("Could not detect driver version"),
-    }
-    let Some(driver_version) = driver_version else {
-        bail!(
+    if let Some(driver_version) = driver_version {
+        log_info(&format!("Using driver version: {}", driver_version));
+        for path in dso_vendor_paths {
+            if let Some(res) = scan_dsos_from_dir(path, &driver_version) {
+                cache_content.paths.push(res);
+            }
+        }
+    } else {
+        log_warn(
             "Could not detect NVIDIA driver version. \
              Ensure the NVIDIA kernel module is loaded (modinfo nvidia) \
-             or that driver libraries (libcuda.so.*) exist in the search paths."
+             or that driver libraries (libcuda.so.*) exist in the search paths.",
         );
     };
-
-    for path in dso_vendor_paths {
-        if let Some(res) = scan_dsos_from_dir(path, &driver_version) {
-            cache_content.paths.push(res);
-        }
-    }
 
     let nix_gl_ld_library_path = if !is_dso_cache_up_to_date(&cache_content, &cache_file_path)
         || !cached_ld_library_path.exists()
