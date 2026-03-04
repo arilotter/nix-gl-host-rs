@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 const IN_NIX_STORE: bool = false;
-const CACHE_VERSION: i32 = 3;
+const CACHE_VERSION: i32 = 4;
 const PATCHELF_PATH: &str = if IN_NIX_STORE {
     "@patchelf-bin@"
 } else {
@@ -32,18 +32,31 @@ struct ResolvedLib {
     fullpath: String,
     last_modification: f64,
     size: u64,
+    #[serde(default)]
+    is_symlink: bool,
+    #[serde(default)]
+    symlink_target: Option<String>,
 }
 
 impl ResolvedLib {
     fn new(name: String, dirpath: String, fullpath: String) -> anyhow::Result<Self> {
-        let metadata = fs::metadata(&fullpath)?;
-        let last_modification = metadata
+        let symlink_meta = fs::symlink_metadata(&fullpath)?;
+        let is_symlink = symlink_meta.file_type().is_symlink();
+        let symlink_target = if is_symlink {
+            let target = fs::read_link(&fullpath)?;
+            Some(target.to_string_lossy().into_owned())
+        } else {
+            None
+        };
+
+        // Use symlink_metadata for symlinks (don't follow), regular metadata for files
+        let last_modification = symlink_meta
             .modified()
             .with_context(|| format!("failed to get metadata for resolved lib {fullpath}"))?
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_secs_f64();
-        let size = metadata.len();
+        let size = symlink_meta.len();
 
         Ok(ResolvedLib {
             name,
@@ -51,6 +64,8 @@ impl ResolvedLib {
             fullpath,
             last_modification,
             size,
+            is_symlink,
+            symlink_target,
         })
     }
 }
@@ -62,6 +77,8 @@ impl PartialEq for ResolvedLib {
             && self.dirpath == other.dirpath
             && self.last_modification == other.last_modification
             && self.size == other.size
+            && self.is_symlink == other.is_symlink
+            && self.symlink_target == other.symlink_target
     }
 }
 
@@ -74,6 +91,8 @@ impl Hash for ResolvedLib {
         self.fullpath.hash(state);
         self.last_modification.to_bits().hash(state);
         self.size.hash(state);
+        self.is_symlink.hash(state);
+        self.symlink_target.hash(state);
     }
 }
 
@@ -300,7 +319,12 @@ fn resolve_libraries(path: &Path, patterns: &[Regex]) -> Vec<ResolvedLib> {
     if let Ok(entries) = fs::read_dir(path) {
         for entry in entries.filter_map(Result::ok) {
             let file_path = entry.path();
-            if file_path.is_file() {
+            // Use symlink_metadata to not follow symlinks — we want to capture
+            // both regular files and symlinks as separate entries
+            let Ok(meta) = file_path.symlink_metadata() else {
+                continue;
+            };
+            if meta.file_type().is_file() || meta.file_type().is_symlink() {
                 if let Some(file_name) = file_path.file_name().and_then(|n| n.to_str()) {
                     if is_dso_matching_pattern(file_name) {
                         if let Ok(lib) = ResolvedLib::new(
@@ -326,7 +350,11 @@ fn copy_and_patch_libs(
 ) -> anyhow::Result<()> {
     let rpath = rpath.unwrap_or(dest_dir);
 
-    for dso in dsos {
+    let (symlinks, real_files): (Vec<_>, Vec<_>) =
+        dsos.iter().partition(|dso| dso.is_symlink);
+
+    // Copy real files first
+    for dso in &real_files {
         let basename = Path::new(&dso.fullpath).file_name().unwrap();
         let newpath = dest_dir.join(basename);
 
@@ -339,12 +367,35 @@ fn copy_and_patch_libs(
         fs::set_permissions(&newpath, perms)?;
     }
 
-    let new_paths: Vec<_> = dsos
+    // Recreate symlinks
+    for dso in &symlinks {
+        let basename = Path::new(&dso.fullpath).file_name().unwrap();
+        let newpath = dest_dir.join(basename);
+
+        if let Some(ref target) = dso.symlink_target {
+            if target.contains('/') || target.contains("..") {
+                eprintln!(
+                    "Warning: symlink {} has a target that points outside its directory: {}",
+                    dso.name, target
+                );
+            }
+            log_info(&format!(
+                "Creating symlink {:?} -> {:?}",
+                newpath, target
+            ));
+            std::os::unix::fs::symlink(target, &newpath)?;
+        }
+    }
+
+    // Only patch real files (not symlinks)
+    let new_paths: Vec<_> = real_files
         .iter()
         .map(|dso| dest_dir.join(Path::new(&dso.fullpath).file_name().unwrap()))
         .collect();
 
-    patch_dsos(&new_paths, rpath)?;
+    if !new_paths.is_empty() {
+        patch_dsos(&new_paths, rpath)?;
+    }
     Ok(())
 }
 
@@ -671,6 +722,9 @@ fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> std::io::Result
         let ty = entry.file_type()?;
         if ty.is_dir() {
             copy_dir_all(entry.path(), dst.as_ref().join(entry.file_name()))?;
+        } else if ty.is_symlink() {
+            let target = fs::read_link(entry.path())?;
+            std::os::unix::fs::symlink(target, dst.as_ref().join(entry.file_name()))?;
         } else {
             fs::copy(entry.path(), dst.as_ref().join(entry.file_name()))?;
         }
@@ -755,6 +809,8 @@ mod tests {
                 fullpath: "/lib/dummyglx.so".to_string(),
                 last_modification: 1670260550.481498,
                 size: 1612,
+                is_symlink: false,
+                symlink_target: None,
             }],
             cuda: vec![ResolvedLib {
                 name: "dummycuda.so".to_string(),
@@ -762,6 +818,8 @@ mod tests {
                 fullpath: "/lib/dummycuda.so".to_string(),
                 last_modification: 2670260550.481498,
                 size: 2612,
+                is_symlink: false,
+                symlink_target: None,
             }],
             generic: vec![ResolvedLib {
                 name: "dummygeneric.so".to_string(),
@@ -769,6 +827,8 @@ mod tests {
                 fullpath: "/lib/dummygeneric.so".to_string(),
                 last_modification: 3670260550.481498,
                 size: 3612,
+                is_symlink: false,
+                symlink_target: None,
             }],
             egl: vec![ResolvedLib {
                 name: "dummyegl.so".to_string(),
@@ -776,6 +836,8 @@ mod tests {
                 fullpath: "/lib/dummyegl.so".to_string(),
                 last_modification: 4670260550.481498,
                 size: 4612,
+                is_symlink: false,
+                symlink_target: None,
             }],
             path: "/path/to/lib/dir".to_string(),
         };

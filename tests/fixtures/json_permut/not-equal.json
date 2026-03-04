@@ -7,7 +7,9 @@
           "dirpath": "/lib",
           "fullpath": "/lib/dummyglx.so",
           "last_modification": 2670260550.481498,
-          "size": 2612
+          "size": 2612,
+          "is_symlink": false,
+          "symlink_target": null
         }
       ],
       "cuda": [
@@ -16,7 +18,9 @@
           "dirpath": "/lib",
           "fullpath": "/lib/dummycuda.so",
           "last_modification": 2670260550.481498,
-          "size": 2612
+          "size": 2612,
+          "is_symlink": false,
+          "symlink_target": null
         }
       ],
       "generic": [
@@ -25,7 +29,9 @@
           "dirpath": "/lib",
           "fullpath": "/lib/dummygeneric.so",
           "last_modification": 3670260550.481498,
-          "size": 3612
+          "size": 3612,
+          "is_symlink": false,
+          "symlink_target": null
         }
       ],
       "egl": [
@@ -34,7 +40,9 @@
           "dirpath": "/lib",
           "fullpath": "/lib/dummyegl.so",
           "last_modification": 4670260550.481498,
-          "size": 4612
+          "size": 4612,
+          "is_symlink": false,
+          "symlink_target": null
         }
       ],
       "path": "/path/to/lib/dir"
@@ -46,7 +54,9 @@
           "dirpath": "/lib",
           "fullpath": "/lib/dummyglx.so",
           "last_modification": 5670260550.481498,
-          "size": 5612
+          "size": 5612,
+          "is_symlink": false,
+          "symlink_target": null
         }
       ],
       "cuda": [
@@ -55,7 +65,9 @@
           "dirpath": "/lib",
           "fullpath": "/lib/dummycuda.so",
           "last_modification": 6670260550.481498,
-          "size": 6612
+          "size": 6612,
+          "is_symlink": false,
+          "symlink_target": null
         }
       ],
       "generic": [
@@ -64,7 +76,9 @@
           "dirpath": "/lib",
           "fullpath": "/lib/dummygeneric.so",
           "last_modification": 7670260550.481498,
-          "size": 7612
+          "size": 7612,
+          "is_symlink": false,
+          "symlink_target": null
         }
       ],
       "egl": [
@@ -73,11 +87,13 @@
           "dirpath": "/lib",
           "fullpath": "/lib/dummyegl.so",
           "last_modification": 8670260550.481498,
-          "size": 8612
+          "size": 8612,
+          "is_symlink": false,
+          "symlink_target": null
         }
       ],
       "path": "/path/to/lib/dir2"
     }
   ],
-  "version": 3
+  "version": 4
 }
