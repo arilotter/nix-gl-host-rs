@@ -562,13 +562,6 @@ fn copy_and_patch_libs(
         let newpath = dest_dir.join(basename);
 
         if let Some(ref target) = dso.symlink_target {
-            if target.contains('/') || target.contains("..") {
-                eprintln!(
-                    "Warning: symlink {} has a target that points outside its directory: {}",
-                    dso.name, target
-                );
-            }
-            log_info(&format!("Creating symlink {:?} -> {:?}", newpath, target));
             std::os::unix::fs::symlink(target, &newpath)?;
         }
     }
